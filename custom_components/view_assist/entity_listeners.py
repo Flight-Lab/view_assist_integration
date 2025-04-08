@@ -220,7 +220,27 @@ class EntityListeners:
         if not is_revert_action:
             self._cancel_display_revert_task()
 
-        # Do navigation and set revert if needed
+        # Store current path in entity attributes to help menu filtering
+        entity_id = get_sensor_entity_from_instance(
+            self.hass, self.config_entry.entry_id
+        )
+        
+        # Update current path attribute
+        await self.hass.services.async_call(
+            DOMAIN,
+            "set_state",
+            {
+                "entity_id": entity_id,
+                "current_path": path,
+            },
+        )
+
+        # Check if menu is active and refresh it for the new path
+        menu_manager = self.hass.data[DOMAIN].get("menu_manager")
+        if menu_manager:
+            await menu_manager.refresh_menu(entity_id)
+
+        # Continue with normal navigation
         browser_id = get_device_name_from_id(
             self.hass, self.config_entry.runtime_data.display_device
         )
