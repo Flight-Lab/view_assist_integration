@@ -235,11 +235,6 @@ class EntityListeners:
             },
         )
 
-        # Check if menu is active and refresh it for the new path
-        menu_manager = self.hass.data[DOMAIN].get("menu_manager")
-        if menu_manager:
-            await menu_manager.refresh_menu(entity_id)
-
         # Continue with normal navigation
         browser_id = get_device_name_from_id(
             self.hass, self.config_entry.runtime_data.display_device
