@@ -3,25 +3,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any
 
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_ENABLE_MENU,
     CONF_ENABLE_MENU_TIMEOUT,
-    CONF_MENU_AUTO_CLOSE,
     CONF_MENU_ITEMS,
     CONF_MENU_TIMEOUT,
     DEFAULT_ENABLE_MENU_TIMEOUT,
-    DEFAULT_MENU_AUTO_CLOSE,
     DEFAULT_MENU_ITEMS,
     DEFAULT_MENU_TIMEOUT,
     DOMAIN,
     VAConfigEntry,
 )
-from .helpers import get_config_entry_by_entity_id, get_sensor_entity_from_instance
+from .helpers import get_config_entry_by_entity_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,18 +32,6 @@ class MenuManager:
         self.config = config
         self._active_menus: dict[str, bool] = {}  # Track open menus by entity_id
         self._timeouts: dict[str, asyncio.Task] = {}  # Track menu timeout timers
-        
-        # Register for state changes to handle initialization
-        self.hass.bus.async_listen_once("homeassistant_started", self._on_ha_started)
-
-    async def _on_ha_started(self, event):
-        """Initialize menu states after Home Assistant has started."""
-        # Check all VA entities to ensure they don't have current view in menu
-        for entry_id in [entry.entry_id for entry in self.hass.config_entries.async_entries(DOMAIN)]:
-            entity_id = get_sensor_entity_from_instance(self.hass, entry_id)
-            if entity_id:
-                # Perform initial filtering of menu icons based on current view
-                await self.refresh_menu(entity_id)
 
     async def toggle_menu(self, entity_id: str, show: bool = None, menu_items: list[str] = None, timeout: int = None) -> None:
         """Toggle menu visibility for an entity."""
@@ -79,37 +64,18 @@ class MenuManager:
         # Update menu state
         self._active_menus[entity_id] = show
 
-        # Get current status icons and available menu items
-        current_icons = current_state.attributes.get("status_icons", [])
+        # Get available menu items
         config_items = config_entry.options.get(CONF_MENU_ITEMS, DEFAULT_MENU_ITEMS)
         items_to_use = menu_items or config_items
 
         if show:
-            # Get current view for filtering
-            current_view = self._get_current_view(current_state)
-            _LOGGER.debug("Current view for filtering: %s", current_view)
-            
-            # First remove any existing menu items
-            base_icons = [icon for icon in current_icons if icon not in config_items]
-            
-            # Now add all menu items that aren't the current view
-            menu_icons = []
-            for item in items_to_use:
-                # Skip if it's the current view
-                if current_view and item == current_view:
-                    continue
-                menu_icons.append(item)
-                
-            # Combine base icons with filtered menu icons
-            updated_icons = menu_icons + base_icons
-            
-            # Update entity with new status icons
+            # Update entity with menu active state
             await self.hass.services.async_call(
                 DOMAIN,
                 "set_state",
                 {
                     "entity_id": entity_id,
-                    "status_icons": updated_icons,
+                    "status_icons": items_to_use + (current_state.attributes.get("status_icons", []) or []),
                     "menu_active": True,  # Explicitly set to True
                 },
             )
@@ -122,7 +88,8 @@ class MenuManager:
                 self._setup_timeout(entity_id, timeout_value)
         else:
             # When hiding, remove all menu items
-            updated_icons = [icon for icon in current_icons if icon not in config_items]
+            updated_icons = [icon for icon in current_state.attributes.get("status_icons", []) 
+                            if icon not in config_items]
             
             # Update entity with filtered status icons
             await self.hass.services.async_call(
@@ -134,107 +101,6 @@ class MenuManager:
                     "menu_active": False,  # Explicitly set to False
                 },
             )
-
-    async def refresh_menu(self, entity_id: str) -> None:
-        """Refresh menu to ensure current view is filtered out."""
-        current_state = self.hass.states.get(entity_id)
-        if not current_state:
-            return
-            
-        # Only refresh if menu is active
-        if not current_state.attributes.get("menu_active", False):
-            return
-            
-        config_entry = get_config_entry_by_entity_id(self.hass, entity_id)
-        if not config_entry:
-            return
-            
-        # Re-apply menu toggle with current items
-        await self.toggle_menu(entity_id, True)
-
-    async def process_menu_action(self, entity_id: str, action: str) -> None:
-        """Process a menu icon action (view, service, entity)."""
-        # First check if auto-close is enabled before processing the action
-        config_entry = get_config_entry_by_entity_id(self.hass, entity_id)
-        auto_close = config_entry and config_entry.options.get(CONF_MENU_AUTO_CLOSE, DEFAULT_MENU_AUTO_CLOSE)
-        
-        # Handle different action types based on prefix
-        # Format: "type:action"
-        path_to_navigate = None
-        
-        if ":" in action:
-            action_type, action_value = action.split(":", 1)
-            
-            if action_type == "view":
-                # Navigate to a view
-                path_to_navigate = f"/view-assist/{action_value}"
-            elif action_type == "service":
-                # Call a service
-                domain, service = action_value.split(".", 1)
-                await self.hass.services.async_call(
-                    domain,
-                    service,
-                    {},
-                )
-            elif action_type == "entity":
-                # Toggle an entity
-                await self.hass.services.async_call(
-                    "homeassistant",
-                    "toggle",
-                    {"entity_id": action_value},
-                )
-        else:
-            # Default action - treat as view navigation
-            path_to_navigate = f"/view-assist/{action}"
-
-        # Close menu first if auto-close is enabled
-        if auto_close:
-            _LOGGER.debug("Auto-closing menu for %s after action", entity_id)
-            await self.toggle_menu(entity_id, False)
-        
-        # Then navigate if needed (after menu is closed)
-        if path_to_navigate:
-            await self.hass.services.async_call(
-                DOMAIN,
-                "navigate",
-                {
-                    "device": entity_id,
-                    "path": path_to_navigate,
-                },
-            )
-
-    def _get_current_view(self, state: State) -> str | None:
-        """Get the current view from a state object."""
-        # First check for current_path attribute
-        if current_path := state.attributes.get("current_path"):
-            match = re.search(r"/view-assist/([^/]+)", current_path)
-            if match:
-                return match.group(1)
-        
-        # Try to get from display device
-        try:
-            display_device = state.attributes.get("display_device")
-            if not display_device:
-                return None
-                
-            # Find browser or path entities for this device
-            for entity in self.hass.states.async_all():
-                if entity.attributes.get("device_id") == display_device:
-                    if "path" in entity.entity_id or "browser" in entity.entity_id:
-                        # Check pathSegments attribute
-                        if path_segments := entity.attributes.get("pathSegments"):
-                            if len(path_segments) > 2 and path_segments[1] == "view-assist":
-                                return path_segments[2]
-                                
-                        # Try entity state or path attribute
-                        if path := entity.state:
-                            match = re.search(r"/view-assist/([^/]+)", path)
-                            if match:
-                                return match.group(1)
-        except Exception as ex:  # noqa: BLE001
-            _LOGGER.debug("Error determining current view: %s", ex)
-        
-        return None
 
     def _setup_timeout(self, entity_id: str, timeout: int) -> None:
         """Setup timeout for menu."""
