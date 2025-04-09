@@ -47,6 +47,7 @@ from .dashboard import (
     DownloadManagerException,
 )
 from .helpers import get_mimic_entity_id
+from .menu_manager import MenuManager
 from .timers import TIMERS, VATimers, decode_time_sentence
 
 _LOGGER = logging.getLogger(__name__)
@@ -139,6 +140,15 @@ LOAD_DASHVIEW_SERVICE_SCHEMA = DASHVIEW_SERVICE_SCHEMA.extend(
     }
 )
 
+TOGGLE_MENU_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTITY_ID): cv.entity_id,
+        vol.Optional("show", default=True): cv.boolean,
+        vol.Optional("menu_items"): vol.Any(cv.ensure_list, None),
+        vol.Optional("timeout"): vol.Any(int, None),
+    }
+)
+
 
 class VAServices:
     """Class to manage services."""
@@ -225,6 +235,13 @@ class VAServices:
             "save_view",
             self.async_handle_save_view,
             schema=DASHVIEW_SERVICE_SCHEMA,
+        )
+        
+        self.hass.services.async_register(
+            DOMAIN,
+            "toggle_menu",
+            self.async_handle_toggle_menu,
+            schema=TOGGLE_MENU_SERVICE_SCHEMA,
         )
 
     # -----------------------------------------------------------------------
@@ -388,6 +405,22 @@ class VAServices:
         )
         return {"result": result}
 
+    # ----------------------------------------------------------------
+    # MENU
+    # ----------------------------------------------------------------
+    async def async_handle_toggle_menu(self, call: ServiceCall):
+        """Handle toggle menu service call."""
+        entity_id = call.data.get(ATTR_ENTITY_ID)
+        if not entity_id:
+            _LOGGER.error("No entity_id provided in toggle_menu service call")
+            return
+            
+        show = call.data.get("show", True)
+        menu_items = call.data.get("menu_items")
+        timeout = call.data.get("timeout")
+        
+        menu_manager: MenuManager = self.hass.data[DOMAIN]["menu_manager"]
+        await menu_manager.toggle_menu(entity_id, show, menu_items, timeout)
     # ----------------------------------------------------------------
     # VIEWS
     # ----------------------------------------------------------------

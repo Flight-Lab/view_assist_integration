@@ -20,6 +20,7 @@ from .helpers import (
 from .http_url import HTTPManager
 from .js_modules import JSModuleRegistration
 from .master_config import MASTER_CONFIG, MasterConfigManager
+from .menu_manager import MenuManager
 from .services import VAServices
 from .templates import setup_va_templates
 from .timers import TIMERS, VATimers
@@ -102,7 +103,7 @@ async def run_if_first_instance(hass: HomeAssistant, entry: VAConfigEntry):
     hass.data[DOMAIN][MASTER_CONFIG] = master_config
     await master_config.load()
 
-    # Inisitialise service
+    # Initialize service
     services = VAServices(hass, entry)
     await services.async_setup_services()
 
@@ -110,6 +111,10 @@ async def run_if_first_instance(hass: HomeAssistant, entry: VAConfigEntry):
     timers = VATimers(hass, entry)
     hass.data[DOMAIN][TIMERS] = timers
     await timers.load()
+    
+    # Setup Menu Manager
+    menu_manager = MenuManager(hass, entry)
+    hass.data[DOMAIN]["menu_manager"] = menu_manager
 
     # Load javascript modules
     jsloader = JSModuleRegistration(hass)
