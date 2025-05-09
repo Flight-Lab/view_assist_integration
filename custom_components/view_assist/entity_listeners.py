@@ -634,7 +634,13 @@ class EntityListeners:
         d = r.dashboard.display_settings
 
         _LOGGER.debug("MODE STATE: %s", new_mode)
-        status_icons = d.status_icons.copy()
+
+        # Get current status icons directly from entity state
+        entity_id = get_sensor_entity_from_instance(self.hass, self.config_entry.entry_id)
+        if entity := self.hass.states.get(entity_id):
+            status_icons = list(entity.attributes.get("status_icons", []))
+        else:
+            status_icons = d.status_icons.copy()
 
         modes = [VAMode.HOLD, VAMode.CYCLE]
 
@@ -649,7 +655,19 @@ class EntityListeners:
 
         ensure_menu_button_at_end(status_icons)
 
+        # Store the updated status icons in the display settings
         d.status_icons = status_icons
+
+        # Update entity state
+        await self.hass.services.async_call(
+            DOMAIN,
+            "set_state",
+            service_data={
+                "entity_id": entity_id,
+                "status_icons": status_icons
+            },
+        )
+
         self.update_entity()
 
         if new_mode != VAMode.CYCLE:
