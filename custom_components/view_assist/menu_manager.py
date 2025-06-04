@@ -27,7 +27,6 @@ from .helpers import (
     get_master_config_entry,
     get_sensor_entity_from_instance,
     normalize_status_items,
-    update_status_icons,
 )
 from .typed import VAConfigEntry, VAEvent, VAMenuConfig
 
@@ -45,6 +44,7 @@ class MenuState:
     configured_items: list[str] = field(default_factory=list)
     status_icons: list[str] = field(default_factory=list)
     system_icons: list[str] = field(default_factory=list)
+    launch_icons: list[str] = field(default_factory=list)
     menu_timeout: asyncio.Task | None = None
     item_timeouts: dict[tuple[str, str, bool], asyncio.Task] = field(
         default_factory=dict
@@ -95,27 +95,85 @@ class MenuManager:
             state = self.hass.states.get(entity_id)
 
             if state:
+                # Get menu items from config
                 menu_items = self._get_config_value(
                     entity_id, f"{CONF_DISPLAY_SETTINGS}.{CONF_MENU_ITEMS}", []
                 )
                 self._menu_states[entity_id].configured_items = menu_items or []
 
-                status_icons = state.attributes.get(CONF_STATUS_ICONS, [])
-                self._menu_states[entity_id].status_icons = (
-                    status_icons if status_icons else []
+                # Get saved launch icons from config
+                saved_status_icons = self._get_config_value(
+                    entity_id, f"{CONF_DISPLAY_SETTINGS}.{CONF_STATUS_ICONS}", []
                 )
+
+                # Get current status icons and menu state
+                current_status_icons = state.attributes.get(
+                    CONF_STATUS_ICONS, [])
+                self._menu_states[entity_id].status_icons = current_status_icons or [
+                ]
                 self._menu_states[entity_id].active = state.attributes.get(
                     "menu_active", False
                 )
 
-                self._menu_states[entity_id].system_icons = [
-                    icon
-                    for icon in self._menu_states[entity_id].status_icons
-                    if icon not in self._menu_states[entity_id].configured_items
-                    and icon != "menu"
-                ]
+                # Initialize the icon categories and restore saved launch icons
+                self._refresh_icon_categories(entity_id, saved_status_icons)
 
         return self._menu_states[entity_id]
+
+    def _refresh_icon_categories(
+        self, entity_id: str, saved_icons: list[str] = None
+    ) -> None:
+        """Refresh and categorize icons from current entity state."""
+        menu_state = self._menu_states[entity_id]
+        state = self.hass.states.get(entity_id)
+
+        if not state:
+            return
+
+        current_icons = state.attributes.get(CONF_STATUS_ICONS, [])
+        menu_state.status_icons = current_icons or []
+
+        # Categorize icons
+        modes = [VAMode.HOLD, VAMode.CYCLE]
+
+        # System icons are icons that are not menu items, modes, or launch
+        system_icons = []
+        launch_icons = []
+
+        # Current mode to add to system icons
+        current_mode = state.attributes.get("mode")
+
+        # If we have saved launch icons, use them to identify which
+        # current icons are launch icons vs system icons
+        if saved_icons:
+            for icon in current_icons:
+                if icon == "menu" or icon in modes:
+                    continue
+                elif icon in menu_state.configured_items:
+                    continue
+                # Consider an icon a launch icon if it was in saved icons
+                elif icon in saved_icons and icon not in menu_state.configured_items:
+                    launch_icons.append(icon)
+                else:
+                    system_icons.append(icon)
+        else:
+            # Without saved icons, use existing categories
+            for icon in current_icons:
+                if icon == "menu" or icon in modes:
+                    continue
+                elif icon in menu_state.configured_items:
+                    continue
+                elif icon in menu_state.launch_icons:
+                    launch_icons.append(icon)
+                else:
+                    system_icons.append(icon)
+
+        # Add current mode to system icons if present
+        if current_mode in modes and current_mode not in system_icons:
+            system_icons.append(current_mode)
+
+        menu_state.system_icons = system_icons
+        menu_state.launch_icons = launch_icons
 
     def _get_config_value(self, entity_id: str, key: str, default: Any = None) -> Any:
         """Get configuration value with hierarchy: entity > master > default."""
@@ -170,31 +228,26 @@ class MenuManager:
 
         return default
 
-    def _refresh_system_icons(self, entity_id: str, menu_state: MenuState) -> list[str]:
-        """Refresh system icons from current entity state."""
-        state = self.hass.states.get(entity_id)
-        if not state:
-            return menu_state.system_icons
+    def _build_status_icons(
+        self, entity_id: str, show_menu_button: bool = False
+    ) -> list[str]:
+        """Build complete status icons list preserving all icon types."""
+        menu_state = self._menu_states[entity_id]
 
-        modes = [VAMode.HOLD, VAMode.CYCLE]
+        if menu_state.active:
+            # When menu is active, show menu items + launch icons + system icons
+            icons = arrange_status_icons(
+                menu_state.configured_items,
+                menu_state.launch_icons + menu_state.system_icons,
+                show_menu_button,
+            )
+        else:
+            # When menu is not active, show launch icons + system icons
+            icons = menu_state.launch_icons.copy() + menu_state.system_icons.copy()
+            if show_menu_button:
+                ensure_menu_button_at_end(icons)
 
-        # Get current status_icons excluding menu items and mode icons
-        current_status_icons = state.attributes.get(CONF_STATUS_ICONS, [])
-        system_icons = [
-            icon
-            for icon in current_status_icons
-            if icon not in menu_state.configured_items
-            and icon != "menu"
-            and icon not in modes
-        ]
-
-        # Add current mode if it exists
-        current_mode = state.attributes.get("mode")
-        if current_mode in modes and current_mode not in system_icons:
-            system_icons.append(current_mode)
-
-        menu_state.system_icons = system_icons
-        return system_icons
+        return icons
 
     async def toggle_menu(
         self, entity_id: str, show: bool | None = None, timeout: int | None = None
@@ -227,58 +280,44 @@ class MenuManager:
 
         # Get menu state and settings
         menu_state = self._get_or_create_state(entity_id)
+        self._refresh_icon_categories(entity_id)
+
         current_active = menu_state.active
         show = show if show is not None else not current_active
 
+        # Cancel any existing timeout
         self._cancel_timeout(entity_id)
 
         # Check if menu button should be shown
         show_menu_button = menu_config == VAMenuConfig.ENABLED_VISIBLE
 
-        # Always refresh system icons to ensure we have latest state
-        system_icons = self._refresh_system_icons(entity_id, menu_state)
-
         # Apply the menu state change
-        changes = {}
-        if show:
-            # Show menu
-            updated_icons = arrange_status_icons(
-                menu_state.configured_items, system_icons, show_menu_button
+        menu_state.active = show
+
+        # Build status icons and prepare changes
+        updated_icons = self._build_status_icons(entity_id, show_menu_button)
+        changes = {"status_icons": updated_icons, "menu_active": show}
+
+        # Handle timeout
+        if show and timeout is not None:
+            self._setup_timeout(entity_id, timeout)
+        elif show:
+            menu_timeout = self._get_config_value(
+                entity_id, f"{CONF_DISPLAY_SETTINGS}.{CONF_MENU_TIMEOUT}", 0
             )
-            menu_state.active = True
-            menu_state.status_icons = updated_icons
-            changes = {"status_icons": updated_icons, "menu_active": True}
-
-            # Handle timeout
-            if timeout is not None:
-                self._setup_timeout(entity_id, timeout)
-            else:
-                menu_timeout = self._get_config_value(
-                    entity_id, f"{CONF_DISPLAY_SETTINGS}.{CONF_MENU_TIMEOUT}", 0
-                )
-                if menu_timeout > 0:
-                    self._setup_timeout(entity_id, menu_timeout)
-        else:
-            # Hide menu
-            updated_icons = system_icons.copy()
-            if show_menu_button:
-                ensure_menu_button_at_end(updated_icons)
-
-            menu_state.active = False
-            menu_state.status_icons = updated_icons
-            changes = {"status_icons": updated_icons, "menu_active": False}
+            if menu_timeout > 0:
+                self._setup_timeout(entity_id, menu_timeout)
 
         # Apply changes
-        if changes:
-            await self._update_entity_state(entity_id, changes)
+        await self._update_entity_state(entity_id, changes)
 
-            # Notify via dispatcher
-            if config_entry:
-                async_dispatcher_send(
-                    self.hass,
-                    f"{DOMAIN}_{config_entry.entry_id}_event",
-                    VAEvent("menu_update", {"menu_active": show}),
-                )
+        # Notify via dispatcher
+        if config_entry:
+            async_dispatcher_send(
+                self.hass,
+                f"{DOMAIN}_{config_entry.entry_id}_event",
+                VAEvent("menu_update", {"menu_active": show}),
+            )
 
     async def add_status_item(
         self,
@@ -303,6 +342,9 @@ class MenuManager:
 
         await self._ensure_initialized()
         menu_state = self._get_or_create_state(entity_id)
+
+        # Refresh from current entity state
+        self._refresh_icon_categories(entity_id)
 
         # Get menu configuration
         menu_config = self._get_config_value(
@@ -331,29 +373,27 @@ class MenuManager:
                 await self._save_to_config_entry_options(
                     entity_id, CONF_MENU_ITEMS, updated_items
                 )
-
-                # Update icons if menu is active
-                if menu_state.active:
-                    updated_icons = arrange_status_icons(
-                        updated_items, menu_state.system_icons, show_menu_button
-                    )
-                    menu_state.status_icons = updated_icons
-                    changes["status_icons"] = updated_icons
         else:
-            # Add to status icons
-            updated_icons = update_status_icons(
-                menu_state.status_icons,
-                add_icons=items,
-                menu_items=menu_state.configured_items if menu_state.active else None,
-                show_menu_button=show_menu_button,
-            )
+            # Add to launch icons if not already there
+            launch_changed = False
+            for item in items:
+                if (
+                    item not in menu_state.launch_icons
+                    and item not in menu_state.system_icons
+                    and item not in menu_state.configured_items
+                ):
+                    menu_state.launch_icons.append(item)
+                    launch_changed = True
 
-            if updated_icons != menu_state.status_icons:
-                menu_state.status_icons = updated_icons
-                changes["status_icons"] = updated_icons
+            # Save launch icons to config if changed
+            if launch_changed:
                 await self._save_to_config_entry_options(
-                    entity_id, CONF_STATUS_ICONS, updated_icons
+                    entity_id, CONF_STATUS_ICONS, menu_state.launch_icons
                 )
+
+        # Update status icons regardless of where we added the items
+        updated_icons = self._build_status_icons(entity_id, show_menu_button)
+        changes["status_icons"] = updated_icons
 
         # Apply changes
         if changes:
@@ -383,6 +423,9 @@ class MenuManager:
         await self._ensure_initialized()
         menu_state = self._get_or_create_state(entity_id)
 
+        # Refresh from current entity state
+        self._refresh_icon_categories(entity_id)
+
         # Get menu configuration
         menu_config = self._get_config_value(
             entity_id,
@@ -406,29 +449,22 @@ class MenuManager:
                 await self._save_to_config_entry_options(
                     entity_id, CONF_MENU_ITEMS, updated_items
                 )
-
-                # Update icons if menu is active
-                if menu_state.active:
-                    updated_icons = arrange_status_icons(
-                        updated_items, menu_state.system_icons, show_menu_button
-                    )
-                    menu_state.status_icons = updated_icons
-                    changes["status_icons"] = updated_icons
         else:
-            # Remove from status icons
-            updated_icons = update_status_icons(
-                menu_state.status_icons,
-                remove_icons=items,
-                menu_items=menu_state.configured_items if menu_state.active else None,
-                show_menu_button=show_menu_button,
-            )
+            # Remove from launch icons
+            original_launch_icons = menu_state.launch_icons.copy()
+            menu_state.launch_icons = [
+                icon for icon in menu_state.launch_icons if icon not in items
+            ]
 
-            if updated_icons != menu_state.status_icons:
-                menu_state.status_icons = updated_icons
-                changes["status_icons"] = updated_icons
+            # Save updated launch icons if they changed
+            if original_launch_icons != menu_state.launch_icons:
                 await self._save_to_config_entry_options(
-                    entity_id, CONF_STATUS_ICONS, updated_icons
+                    entity_id, CONF_STATUS_ICONS, menu_state.launch_icons
                 )
+
+        # Update status icons regardless of where we removed the items
+        updated_icons = self._build_status_icons(entity_id, show_menu_button)
+        changes["status_icons"] = updated_icons
 
         # Apply changes and cancel timeouts
         if changes:
@@ -449,10 +485,33 @@ class MenuManager:
         try:
             new_options = dict(config_entry.options)
 
-            new_options[option_key] = value
+            # Ensure we have display_settings dictionary
+            if CONF_DISPLAY_SETTINGS not in new_options:
+                new_options[CONF_DISPLAY_SETTINGS] = {}
+            elif not isinstance(new_options[CONF_DISPLAY_SETTINGS], dict):
+                new_options[CONF_DISPLAY_SETTINGS] = {}
+
+            # Create a copy of the existing display settings to avoid reference issues
+            display_settings = dict(new_options[CONF_DISPLAY_SETTINGS])
+
+            # Handle different option keys appropriately
+            if option_key == CONF_MENU_ITEMS:
+                display_settings[CONF_MENU_ITEMS] = value
+            elif option_key == CONF_STATUS_ICONS:
+                display_settings[CONF_STATUS_ICONS] = value
+            else:
+                # For other options, set directly
+                new_options[option_key] = value
+
+            # Update display settings in options
+            new_options[CONF_DISPLAY_SETTINGS] = display_settings
+
+            # Update the config entry with new options
             self.hass.config_entries.async_update_entry(
                 config_entry, options=new_options
             )
+            _LOGGER.debug("Saved %s to config entry options: %s",
+                          option_key, value)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Error saving config entry options: %s", str(err))
 
